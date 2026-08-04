@@ -53,6 +53,14 @@ static int sock;
 static int use_tcp = 0;
 
 static struct addrinfo* addr=NULL;
+
+// extra UDP fan-out destinations (-U), sent in addition to -h/-P
+#define MAX_UDP_EXTRA 16
+static char *extra_host[MAX_UDP_EXTRA];
+static char *extra_port[MAX_UDP_EXTRA];
+static struct addrinfo *extra_addr[MAX_UDP_EXTRA];
+static int n_extra = 0;
+
 // messages can be retrived from a different thread
 static pthread_mutex_t message_mutex;
 
@@ -108,6 +116,24 @@ const char *aisdecoder_next_message()
 
 static int initSocket(const char *host, const char *portname);
 int send_nmea( const char *sentence, unsigned int length);
+int isBroadcastAddress(const char *ipAddress);
+
+// address is resolved later, in init_ais_decoder()
+int aisdecoder_add_udp_destination(const char *hostport) {
+	const char *c = strrchr(hostport, ':');
+	size_t hlen;
+	if (n_extra >= MAX_UDP_EXTRA || !c || c == hostport || !c[1]) {
+		fprintf(stderr, "Bad or too many -U destination: '%s'\n", hostport);
+		return 0;
+	}
+	hlen = (size_t)(c - hostport);
+	extra_host[n_extra] = malloc(hlen + 1);
+	memcpy(extra_host[n_extra], hostport, hlen);
+	extra_host[n_extra][hlen] = '\0';
+	extra_port[n_extra] = strdup(c + 1);
+	n_extra++;
+	return 1;
+}
 
 void sound_level_changed(float level, int channel, unsigned char high) {
     if (high != 0)
@@ -152,6 +178,11 @@ int send_nmea( const char *sentence, unsigned int length) {
 		return add_nmea_ais_message(sentence, length);
 	}
 	else if(sock) {
+		int i;
+		// also send to each -U fan-out destination (best-effort, never fatal)
+		for (i = 0; i < n_extra; i++)
+			if (extra_addr[i])
+				sendto(sock, sentence, length, 0, extra_addr[i]->ai_addr, extra_addr[i]->ai_addrlen);
 		return sendto(sock, sentence, length, 0, addr->ai_addr, addr->ai_addrlen);
 	}
         return 0;
@@ -173,6 +204,24 @@ int init_ais_decoder(char * host, char * port ,int show_levels,int _debug_nmea,i
 	else {
 		if (!initTcpSocket(port, debug_nmea, tcp_keep_ais_time)) {
 			return EXIT_FAILURE;
+		}
+	}
+	// resolve -U destinations, reusing the socket from initSocket()
+	if (n_extra > 0 && sock) {
+		int i, enable = 1;
+		struct addrinfo hints;
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_DGRAM;
+		hints.ai_protocol = IPPROTO_UDP;
+		for (i = 0; i < n_extra; i++) {
+			if (getaddrinfo(extra_host[i], extra_port[i], &hints, &extra_addr[i]) != 0) {
+				fprintf(stderr, "Failed to resolve -U %s:%s\n", extra_host[i], extra_port[i]);
+				return EXIT_FAILURE;
+			}
+			if (isBroadcastAddress(extra_host[i]))
+				setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &enable, sizeof(enable));
+			fprintf(stderr, "AIS data will also be sent to %s:%s\n", extra_host[i], extra_port[i]);
 		}
 	}
     if (show_levels) on_sound_level_changed=sound_level_changed;
@@ -202,6 +251,14 @@ int free_ais_decoder(void)
     
     freeSoundDecoder();
     freeaddrinfo(addr);
+    {
+        int i;
+        for (i = 0; i < n_extra; i++) {
+            if (extra_addr[i]) freeaddrinfo(extra_addr[i]);
+            free(extra_host[i]);
+            free(extra_port[i]);
+        }
+    }
 #ifdef WIN32
     WSACleanup();
 #endif

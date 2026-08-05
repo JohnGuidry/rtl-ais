@@ -33,6 +33,7 @@ Use: rtl_ais [options] [outputfile]
         Built-in AIS decoder options:
         [-h host (default: 127.0.0.1)]
         [-P port (default: 10110)]
+        [-U host:port also send NMEA to this UDP address (repeatable)]
         [-T use TCP communication as tcp listener ( -h is ignored)]
         [-t time to keep ais messages in sec, using tcp listener (default: 15)]
         [-n log NMEA sentences to console (stderr) (default off)]

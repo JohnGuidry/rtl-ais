@@ -25,6 +25,7 @@
 typedef void* rtlsdr_dev_t;
 #include "convenience.h"
 #include "rtl_ais.h"
+#include "aisdecoder/aisdecoder.h"
 
 void usage(void)
 {
@@ -53,6 +54,7 @@ void usage(void)
 		"\tBuilt-in AIS decoder options:\n"
 		"\t[-h host (default: 127.0.0.1)]\n"
 		"\t[-P port (default: 10110)]\n"
+		"\t[-U host:port also send NMEA to this UDP address (repeatable)]\n"
 		"\t[-T use TCP communication, rtl-ais is tcp server ( -h is ignored)\n"
 		"\t[-t time to keep ais messages in sec, using tcp listener (default: 15)\n"
 		"\t[-n log NMEA sentences to console (stderr) (default off)]\n"
@@ -105,7 +107,7 @@ int main(int argc, char **argv)
         config.host = strdup("127.0.0.1");
         config.port = strdup("10110");
         
-	while ((opt = getopt(argc, argv, "l:r:s:o:EODd:g:p:RATIt:P:h:nLS:?")) != -1)
+	while ((opt = getopt(argc, argv, "l:r:s:o:EODd:g:p:RATIt:P:h:nLS:U:?")) != -1)
 	{
 		switch (opt) {
 		case 'l':
@@ -160,6 +162,10 @@ int main(int argc, char **argv)
                         break;
 		case 'h':
 			config.host=strdup(optarg);
+			break;
+		case 'U':
+			if (!aisdecoder_add_udp_destination(optarg))
+				return 2;
 			break;
 		case 'L':
 			config.show_levels=1;

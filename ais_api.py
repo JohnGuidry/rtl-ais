@@ -1,17 +1,56 @@
 #!/usr/bin/env python3
 """
-ais_api.py — lightweight HTTP API that serves live AIS vessel positions as JSON.
-Reads from ais_capture.log and decodes on the fly. Runs on port 8080.
+ais_api.py — lightweight HTTP API that serves live AIS vessel positions
+and historical heatmap density as JSON. Reads from ais_capture.log and
+decodes on the fly. Runs on port 8080.
+
+Endpoints:
+  /api/vessels          — live vessel state (tails the capture log)
+  /api/heatmap?hours=N  — vessel-presence density grid (N hours, 0 = all logs)
+
+Heatmap method (vessel-presence):
+  Old method counted every decoded sentence, so a docked ferry beaconing
+  every 2 s dominated the map (transmission rate != presence), Class B
+  position reports (types 18/19) were ignored, and only the two newest
+  log files were read.
+
+  The new method counts distinct (vessel, grid cell, 10-minute bucket)
+  presences across ALL rotated logs (log, .1, .2.gz ...), so heat
+  accumulates where vessels actually spend time, at a rate every vessel
+  contributes equally regardless of beacon interval.
+
+Data integrity:
+  - Only single-fragment sentences are treated as position reports.
+    Types 1/2/3/18/19 are ALWAYS single-fragment in the AIS spec. A
+    multi-fragment *continuation* payload (e.g. part 2 of a type-5
+    static report) decoded as a standalone frame produces phantom
+    vessels at (0, 113.6) — the tail padding bits of the pair. This was
+    the source of "vessels" in the South China Sea on a Port Townsend
+    receiver.
+  - Sentinel (91/181) and no-fix (0,0) positions are dropped.
+  - A geo-fence centered on the median received position (radius
+    AIS_FENCE_KM, default 100 km) drops any transmitter with a broken
+    GPS from smearing the map.
+  - rtl_ais already enforces the 16-bit data-link CRC before emitting a
+    sentence (verified in aisdecoder/lib/protodec.c), so log lines are
+    CRC-valid at the source.
 """
+import gzip
 import json
+import math
+import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 LOGFILE = Path.home() / "ais_capture.log"
-LOGFILE_ROT = Path.home() / "ais_capture.log.1"
+
+HEATMAP_BIN = 0.005                                  # ~0.5 km grid cells
+HEATMAP_BUCKET_S = 600                               # vessel-presence bucket = 10 min
+HEATMAP_FENCE_KM = float(os.environ.get("AIS_FENCE_KM", "100"))
+HEATMAP_CACHE_TTL = 300                              # seconds between full rescans
 
 # ── AIS decoder (shared logic) ──────────────────────────────────────────────
 
@@ -69,6 +108,14 @@ def is_valid_position(lat, lon):
         return False
     return True
 
+def haversine_km(lat1, lon1, lat2, lon2):
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
 NAV_STATUS = {
     0: "Under way", 1: "At anchor", 2: "Not under command",
     3: "Restricted", 4: "Constrained", 5: "Moored",
@@ -98,6 +145,13 @@ def parse_line(line):
     vdm = parts[1].split(',')
     if len(vdm) < 6:
         return
+    # Only decode the FIRST fragment of a sentence group. Everything we
+    # use (type 1/2/3/18/19 positions, type 5/24 names) lives in
+    # fragment 1. Decoding a continuation payload standalone yields
+    # phantom positions — e.g. part 2 of a type-5 pair decodes as a
+    # "type 3" vessel at (0, 113.6).
+    if vdm[2] != '1':
+        return
     payload = vdm[5]
     channel = vdm[4]
     bits = decode_payload(payload)
@@ -114,8 +168,8 @@ def parse_line(line):
             nav = get_bits(bits, 38, 4)
             entry = vessels.setdefault(mmsi, {})
             entry.update({
-                'mmsi': mmsi,
-                'speed': speed, 'course': course, 'heading': heading,
+                'mmsi': mmsi, 'speed': speed, 'course': course,
+                'heading': heading,
                 'nav_status': NAV_STATUS.get(nav, str(nav)),
                 'channel': channel, 'last_pos': ts,
             })
@@ -124,6 +178,24 @@ def parse_line(line):
                 entry['lon'] = lon
             else:
                 # Drop stale bogus position from a previous valid fix
+                entry.pop('lat', None)
+                entry.pop('lon', None)
+        elif msg_type in (18, 19):
+            # Class B "CS" position report: same fields as 1/2/3 but the
+            # position block sits 4 bits earlier (no nav status field).
+            lon = get_signed_bits(bits, 57, 28) / 600000.0
+            lat = get_signed_bits(bits, 85, 27) / 600000.0
+            speed = get_bits(bits, 46, 10) / 10.0
+            course = get_bits(bits, 112, 12) / 10.0
+            entry = vessels.setdefault(mmsi, {})
+            entry.update({
+                'mmsi': mmsi, 'speed': speed, 'course': course,
+                'channel': channel, 'last_pos': ts,
+            })
+            if is_valid_position(lat, lon):
+                entry['lat'] = lat
+                entry['lon'] = lon
+            else:
                 entry.pop('lat', None)
                 entry.pop('lon', None)
         elif msg_type == 5:
@@ -152,8 +224,6 @@ def parse_line(line):
 
 def tail_log():
     # Tail the AIS log, handling logrotate copytruncate.
-    while not LOGFILE.exists():
-        time.sleep(2)
     while True:
         try:
             with open(LOGFILE) as f:
@@ -179,66 +249,138 @@ def tail_log():
         except (OSError, IOError):
             time.sleep(2)
 
-# ── HTTP server ─────────────────────────────────────────────────────────────
+# ── Heatmap (vessel-presence density) ───────────────────────────────────────
 
+_heatmap_cache = {}  # max_hours -> (expires_at, payload)
 
-# ── Heatmap (historical position density) ───────────────────────────────────
+def _iter_capture_logs():
+    """All capture logs including rotations: log, .1, .2.gz, ... .7.gz.
 
-from collections import defaultdict as _dd
-from datetime import timedelta as _td
+    logrotate runs daily with `copytruncate delaycompress rotate 7`, so
+    yesterday's log is .1 (uncompressed) and older ones are .gz.
+    """
+    return sorted(Path.home().glob("ais_capture.log*"), key=lambda p: p.name)
 
-HEATMAP_BIN = 0.005  # ~0.5 km grid cells
+def scan_position_frames(cutoff_ts=None):
+    """Yield (ts, mmsi, lat, lon) for plausible position reports.
 
-def build_heatmap(max_hours=24):
-    """Scan log files and build a lat/lon density grid.
-    Returns list of [lat, lon, weight] for leaflet.heat."""
-    grid = _dd(int)  # (lat_bin, lon_bin) -> count
-
-    logfiles = []
-    if LOGFILE.exists():
-        logfiles.append(LOGFILE)
-    if LOGFILE_ROT.exists():
-        logfiles.append(LOGFILE_ROT)
-
-    cutoff_ts = None
-    if max_hours > 0:
-        cutoff = datetime.now() - _td(hours=max_hours)
-        cutoff_ts = cutoff.isoformat(timespec="seconds")
-
-    for logfile in logfiles:
+    Single-fragment position messages only: types 1/2/3 (Class A) and
+    18/19 (Class B) — per the AIS spec these are always one fragment.
+    Continuation fragments of multi-part sentences are not position
+    reports; decoding them standalone produces garbage coordinates.
+    """
+    for logfile in _iter_capture_logs():
         try:
-            with open(logfile) as f:
+            opener = gzip.open if logfile.suffix == '.gz' else open
+            with opener(logfile, 'rt', errors='replace') as f:
                 for line in f:
-                    if "!AIVDM" not in line and "!AIVDO" not in line:
+                    if '!AIVDM' not in line and '!AIVDO' not in line:
                         continue
-                    parts = line.split(" ", 1)
+                    parts = line.split(' ', 1)
                     if len(parts) < 2:
                         continue
                     ts = parts[0]
                     if cutoff_ts and ts < cutoff_ts:
                         continue
-                    vdm = parts[1].split(",")
+                    vdm = parts[1].split(',')
                     if len(vdm) < 6:
                         continue
-                    payload = vdm[5]
-                    bits = decode_payload(payload)
-                    msg_type = get_bits(bits, 0, 6)
-                    if msg_type not in (1, 2, 3):
+                    # Position reports are always single-fragment
+                    if vdm[1] != '1' or vdm[2] != '1':
                         continue
-                    lon = get_signed_bits(bits, 61, 28) / 600000.0
-                    lat = get_signed_bits(bits, 89, 27) / 600000.0
+                    payload = vdm[5]
+                    if not payload:
+                        continue
+                    # First payload char encodes the first 6 bits (= msg
+                    # type): '1'/'2'/'3' = Class A positions, 'B'=18 and
+                    # 'C'=19 = Class B positions.
+                    c0 = payload[0]
+                    if c0 not in '123BC':
+                        continue
+                    # Only the bits we read live below 144; decoding 24
+                    # chars (padded) is ~2x faster than the full payload.
+                    bits = decode_payload(payload[:24])
+                    mmsi = get_bits(bits, 8, 30)
+                    if c0 in '123':
+                        lon = get_signed_bits(bits, 61, 28) / 600000.0
+                        lat = get_signed_bits(bits, 89, 27) / 600000.0
+                    else:  # 'B' (18) / 'C' (19): Class B, no nav status
+                        lon = get_signed_bits(bits, 57, 28) / 600000.0
+                        lat = get_signed_bits(bits, 85, 27) / 600000.0
                     if not is_valid_position(lat, lon):
                         continue
-                    lat_bin = round(lat / HEATMAP_BIN) * HEATMAP_BIN
-                    lon_bin = round(lon / HEATMAP_BIN) * HEATMAP_BIN
-                    grid[(lat_bin, lon_bin)] += 1
+                    yield ts, mmsi, lat, lon
         except (OSError, IOError):
             continue
 
-    points = []
-    for (lat, lon), count in sorted(grid.items()):
-        points.append([round(lat, 5), round(lon, 5), count])
-    return points
+def build_heatmap(max_hours=24):
+    """Vessel-presence density grid.
+
+    Weight per grid cell = number of distinct (vessel, cell, 10-minute
+    bucket) presences. A docked ferry beaconing every 2 seconds adds 6
+    units per hour (not 1800); a yacht that transits a cell in 10
+    minutes adds 1. Heat accumulates where vessel TIME is spent, not
+    where transmitters are chatty.
+    """
+    cached = _heatmap_cache.get(max_hours)
+    if cached and time.time() < cached[0]:
+        return cached[1]
+
+    cutoff_ts = None
+    if max_hours > 0:
+        cutoff_ts = (datetime.now() - timedelta(hours=max_hours)) \
+            .isoformat(timespec='seconds')
+
+    payload = {
+        'timestamp': datetime.now().isoformat(),
+        'max_hours': max_hours,
+        'bin_size': HEATMAP_BIN,
+        'bucket_seconds': HEATMAP_BUCKET_S,
+        'fence_km': HEATMAP_FENCE_KM,
+        'method': 'vessel-presence',
+    }
+
+    frames = list(scan_position_frames(cutoff_ts))
+    if not frames:
+        payload.update({'point_count': 0, 'vessel_count': 0, 'points': []})
+        _heatmap_cache[max_hours] = (time.time() + HEATMAP_CACHE_TTL, payload)
+        return payload
+
+    # Geo-fence: center on the median received position. The median is
+    # robust to outliers; combined with the fragment guard this stops
+    # both phantom positions and any real transmitter with a broken GPS.
+    lats = sorted(f[2] for f in frames)
+    lons = sorted(f[3] for f in frames)
+    clat, clon = lats[len(lats) // 2], lons[len(lons) // 2]
+
+    presence = set()   # (mmsi, cell_lat, cell_lon, bucket)
+    vessels = set()
+    bucket_min = HEATMAP_BUCKET_S // 60
+    for ts, mmsi, lat, lon in frames:
+        if haversine_km(clat, clon, lat, lon) > HEATMAP_FENCE_KM:
+            continue
+        vessels.add(mmsi)
+        cell_lat = round(lat / HEATMAP_BIN) * HEATMAP_BIN
+        cell_lon = round(lon / HEATMAP_BIN) * HEATMAP_BIN
+        bucket = ts[:14] + '%02d' % ((int(ts[14:16]) // bucket_min) * bucket_min)
+        presence.add((mmsi, cell_lat, cell_lon, bucket))
+
+    grid = {}
+    for mmsi, cell_lat, cell_lon, bucket in presence:
+        key = (cell_lat, cell_lon)
+        grid[key] = grid.get(key, 0) + 1
+
+    points = [[round(lat, 5), round(lon, 5), cnt]
+              for (lat, lon), cnt in sorted(grid.items())]
+    payload.update({
+        'point_count': len(points),
+        'vessel_count': len(vessels),
+        'points': points,
+    })
+    _heatmap_cache[max_hours] = (time.time() + HEATMAP_CACHE_TTL, payload)
+    return payload
+
+# ── HTTP server ─────────────────────────────────────────────────────────────
 
 class AISHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -266,8 +408,7 @@ class AISHandler(BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Cache-Control', 'no-cache')
             self.end_headers()
-            self.write = self.wfile.write
-            self.write(body)
+            self.wfile.write(body)
         elif self.path == '/api/heatmap' or self.path.startswith('/api/heatmap?'):
             from urllib.parse import urlparse, parse_qs
             max_hours = 24
@@ -278,14 +419,7 @@ class AISHandler(BaseHTTPRequestHandler):
                         max_hours = int(params['hours'][0])
                     except ValueError:
                         pass
-            points = build_heatmap(max_hours)
-            data = {
-                'timestamp': datetime.now().isoformat(),
-                'max_hours': max_hours,
-                'bin_size': HEATMAP_BIN,
-                'point_count': len(points),
-                'points': points,
-            }
+            data = build_heatmap(max_hours)
             body = json.dumps(data, default=str).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
